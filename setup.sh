@@ -121,9 +121,13 @@ echo ""
 # Skip confirmation to avoid potential stdin issues
 print_message "$GREEN" "Proceeding with installation..."
 
-# Create log file
-LOG_FILE="media_server_setup_$(date +%Y%m%d_%H%M%S).log"
+# Create log file with full path
+LOG_FILE="$HOME/media_server_setup_$(date +%Y%m%d_%H%M%S).log"
 print_message "$BLUE" "Logs will be saved to $LOG_FILE"
+# Enable more verbose output
+set -x
+exec > >(tee -a "$LOG_FILE") 2>&1
+print_message "$YELLOW" "Enabled verbose logging mode"
 
 # Update and upgrade the system
 print_message "$BLUE" "Updating system packages..."
@@ -198,13 +202,37 @@ print_message "$BLUE" "Cloning the media server repository..."
     cd ~
     if [ -d "raspberry-pi-media-server" ]; then
         cd raspberry-pi-media-server
+        print_message "$YELLOW" "Existing repository found. Updating..."
         git pull
     else
+        print_message "$YELLOW" "Cloning repository from GitHub..."
         git clone https://github.com/LucasACH/raspberry-pi-media-server.git
         cd raspberry-pi-media-server
     fi
-} >> "$LOG_FILE" 2>&1 || {
-    print_message "$RED" "Failed to clone repository. Check $LOG_FILE for details."
+    
+    # Verify repository contents
+    print_message "$BLUE" "Verifying repository structure..."
+    echo "Repository contents:" >> "$LOG_FILE"
+    ls -la >> "$LOG_FILE"
+    
+    # Check for stack directories
+    for dir in tools monitoring seedbox web; do
+        if [ ! -d "$dir" ]; then
+            print_message "$RED" "Error: Required directory '$dir' not found in repository."
+            print_message "$RED" "Repository structure is not as expected."
+            exit 1
+        fi
+        
+        # Check for docker-compose files
+        if [ ! -f "$dir/docker-compose.yml" ]; then
+            print_message "$RED" "Error: docker-compose.yml not found in $dir directory."
+            exit 1
+        fi
+    done
+    
+    print_message "$GREEN" "Repository structure verified."
+} 2>&1 | tee -a "$LOG_FILE" || {
+    print_message "$RED" "Failed to clone repository. See output above for details."
     exit 1
 }
 
@@ -245,10 +273,16 @@ EOF
 # Create necessary directories for media storage
 print_message "$BLUE" "Creating media directories..."
 {
+    print_message "$YELLOW" "Creating directories at $DATA_PATH..."
     sudo mkdir -p "$DATA_PATH/torrents" "$DATA_PATH/movies" "$DATA_PATH/tv" "$DATA_PATH/anime" "$DATA_PATH/downloads"
+    
+    print_message "$YELLOW" "Setting ownership to $USER_NAME:$USER_NAME..."
     sudo chown -R "$USER_NAME":"$USER_NAME" "$DATA_PATH"
-} >> "$LOG_FILE" 2>&1 || {
-    print_message "$RED" "Failed to create media directories. Check $LOG_FILE for details."
+    
+    print_message "$YELLOW" "Checking directory permissions..."
+    ls -la "$DATA_PATH"
+} 2>&1 | tee -a "$LOG_FILE" || {
+    print_message "$RED" "Failed to create media directories. See output above for details."
     exit 1
 }
 
@@ -258,25 +292,75 @@ print_message "$BLUE" "Deploying Docker stacks..."
 # Get Raspberry Pi's IP address
 PI_IP=$(hostname -I | awk '{print $1}')
 
-# Function to deploy a stack with progress indicator
+# Function to deploy a stack with progress indicator and detailed output
 deploy_stack() {
     local stack_name=$1
     print_message "$YELLOW" "Deploying $stack_name stack..."
     
     cd "$stack_name"
-    if docker-compose up -d >> "$LOG_FILE" 2>&1; then
+    
+    # Check if docker-compose.yml exists
+    if [ ! -f "docker-compose.yml" ]; then
+        print_message "$RED" "❌ Failed to deploy $stack_name stack: docker-compose.yml not found in $(pwd)"
+        cd ..
+        return 1
+    fi
+    
+    # Show the compose file content for debugging
+    echo "===== Contents of $stack_name/docker-compose.yml =====" >> "$LOG_FILE"
+    cat docker-compose.yml >> "$LOG_FILE"
+    echo "====================================================" >> "$LOG_FILE"
+    
+    # Run docker-compose with verbose output
+    print_message "$BLUE" "Running docker-compose for $stack_name..."
+    if docker-compose config > /dev/null 2>&1; then
+        print_message "$GREEN" "✓ Docker-compose configuration valid"
+    else
+        print_message "$RED" "✗ Docker-compose configuration invalid:"
+        docker-compose config 2>&1 | tee -a "$LOG_FILE"
+        cd ..
+        return 1
+    fi
+    
+    # Show docker info for debugging
+    echo "===== Docker Info =====" >> "$LOG_FILE"
+    docker info >> "$LOG_FILE" 2>&1
+    echo "======================" >> "$LOG_FILE"
+    
+    # Run docker-compose with verbose output
+    print_message "$BLUE" "Starting containers for $stack_name..."
+    if docker-compose up -d 2>&1 | tee -a "$LOG_FILE"; then
         print_message "$GREEN" "✅ $stack_name stack deployed successfully!"
     else
-        print_message "$RED" "❌ Failed to deploy $stack_name stack. Check $LOG_FILE for details."
+        print_message "$RED" "❌ Failed to deploy $stack_name stack. Error output:"
+        docker-compose logs 2>&1 | tee -a "$LOG_FILE"
     fi
     cd ..
 }
 
-# Deploy all stacks
-deploy_stack "tools"
-deploy_stack "monitoring"
-deploy_stack "seedbox"
-deploy_stack "web"
+# Deploy all stacks with detailed error reporting
+print_message "$BLUE" "Checking Docker status before deployment..."
+if ! docker ps > /dev/null 2>&1; then
+    print_message "$RED" "Docker is not running or you don't have permission to use it."
+    print_message "$YELLOW" "Try running: sudo systemctl start docker"
+    print_message "$YELLOW" "Or add your user to the docker group and log out/in: sudo usermod -aG docker $USER"
+    exit 1
+fi
+
+print_message "$GREEN" "Docker is running properly."
+print_message "$BLUE" "Here are the available Docker images:"
+docker images
+
+# Deploy stacks with error handling
+print_message "$BLUE" "Starting stack deployment..."
+deploy_stack "tools" || print_message "$RED" "Tools stack deployment failed"
+deploy_stack "monitoring" || print_message "$RED" "Monitoring stack deployment failed"
+deploy_stack "seedbox" || print_message "$RED" "Seedbox stack deployment failed"
+deploy_stack "web" || print_message "$RED" "Web stack deployment failed"
+
+# Check which containers are running
+print_message "$BLUE" "Currently running containers:"
+docker ps
 
 # Final message
 print_message "$GREEN" "==================================================="
