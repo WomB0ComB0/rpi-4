@@ -46,8 +46,8 @@ get_input() {
     local default=$2
     local input
     
-    echo -n -e "${BLUE}$prompt [$default]: ${NC}"
-    read input
+    echo -e "${BLUE}$prompt [$default]: ${NC}"
+    read -r input
     echo "${input:-$default}"
 }
 
@@ -81,7 +81,8 @@ if ! command_exists apt-get; then
 fi
 
 # Get user configuration
-print_message "$BLUE" "Setting up configuration..."
+print_message "$BLUE" "Setting up configuration with default values..."
+print_message "$YELLOW" "NOTICE: This is a non-interactive version to avoid stdin hang issues"
 echo ""
 
 # Define default values
@@ -95,36 +96,30 @@ DEFAULT_PGID=$(id -g)
 DEFAULT_USER_NAME="$USER"
 DEFAULT_DATA_PATH="/data"
 
-# Ask for configuration values
-TIMEZONE=$(get_input "Timezone" "$DEFAULT_TIMEZONE")
-DUCKDNS_SUBDOMAIN=$(get_input "DuckDNS Subdomain" "$DEFAULT_DUCKDNS_SUBDOMAIN")
-DUCKDNS_TOKEN=$(get_input "DuckDNS Token" "$DEFAULT_DUCKDNS_TOKEN")
-MYSQL_USER=$(get_input "MySQL User" "$DEFAULT_MYSQL_USER")
-MYSQL_PASSWORD=$(get_input "MySQL Password" "$DEFAULT_MYSQL_PASSWORD")
-PUID=$(get_input "PUID" "$DEFAULT_PUID")
-PGID=$(get_input "PGID" "$DEFAULT_PGID")
-USER_NAME=$(get_input "Username" "$DEFAULT_USER_NAME")
-DATA_PATH=$(get_input "Data storage path" "$DEFAULT_DATA_PATH")
-
-echo ""
-print_message "$YELLOW" "Review your configuration:"
+# Auto-configure with default values to avoid input issues
+print_message "$YELLOW" "Using default configuration (modify the script to change values):"
+TIMEZONE="$DEFAULT_TIMEZONE"
 echo "Timezone: $TIMEZONE"
+DUCKDNS_SUBDOMAIN="$DEFAULT_DUCKDNS_SUBDOMAIN"
 echo "DuckDNS Subdomain: $DUCKDNS_SUBDOMAIN"
+DUCKDNS_TOKEN="$DEFAULT_DUCKDNS_TOKEN"
 echo "DuckDNS Token: ${DUCKDNS_TOKEN:0:4}****"
+MYSQL_USER="$DEFAULT_MYSQL_USER"
 echo "MySQL User: $MYSQL_USER"
+MYSQL_PASSWORD="$DEFAULT_MYSQL_PASSWORD"
 echo "MySQL Password: ${MYSQL_PASSWORD:0:1}*****"
+PUID="$DEFAULT_PUID"
 echo "PUID: $PUID"
+PGID="$DEFAULT_PGID"
 echo "PGID: $PGID"
+USER_NAME="$DEFAULT_USER_NAME"
 echo "Username: $USER_NAME"
+DATA_PATH="$DEFAULT_DATA_PATH"
 echo "Data Path: $DATA_PATH"
+echo ""
 
-echo ""
-read -p "Continue with installation? (y/n): " -n 1 -r
-echo ""
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    print_message "$RED" "Setup cancelled."
-    exit 1
-fi
+# Skip confirmation to avoid potential stdin issues
+print_message "$GREEN" "Proceeding with installation..."
 
 # Create log file
 LOG_FILE="media_server_setup_$(date +%Y%m%d_%H%M%S).log"
