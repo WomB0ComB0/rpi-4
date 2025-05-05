@@ -9,7 +9,8 @@
 # Jackett, and monitoring tools (Grafana).
 #
 # Addresses git clone issues on low-RAM devices by using shallow/single-branch
-# clone and suggests checking/increasing swap.
+# clone and suggests checking/increasing swap. Includes a check for disk
+# space before creating a swap file.
 #=============================================================================
 
 # --- Configuration ---
@@ -36,6 +37,8 @@ MYSQL_PASSWORD="npm_password"      # MySQL password for Nginx Proxy Manager data
 # Swap Configuration (Optional but Recommended for 1GB RAM)
 # Set desired swap size in MB. Script will add/increase if current total swap is less.
 DESIRED_SWAP_MB=1024 # Set to 0 to skip swap check/increase
+# Add a buffer for filesystem overhead when checking space
+SWAP_SPACE_BUFFER_MB=100 # Amount of extra free space (in MB) to require beyond DESIRED_SWAP_MB
 
 # --- Terminal colors ---
 RED='\033[0;31m'
@@ -153,7 +156,7 @@ fi
 
 # Check for essential commands
 print_status "Checking for essential commands..."
-ESSENTIAL_COMMANDS=("curl" "git" "wget" "awk" "grep" "sed" "tee" "unzip") # Added unzip
+ESSENTIAL_COMMANDS=("curl" "git" "wget" "awk" "grep" "sed" "tee" "unzip" "free" "df") # Added free and df
 for cmd in "${ESSENTIAL_COMMANDS[@]}"; do
     if ! command_exists "$cmd"; then
         print_error "Essential command '$cmd' not found. Please install it."
@@ -202,72 +205,89 @@ if [ "$DESIRED_SWAP_MB" -gt 0 ]; then
 
         SWAPFILE="/swapfile"
         SWAP_SIZE_BYTES=$((DESIRED_SWAP_MB * 1024 * 1024)) # Convert MB to Bytes
+        REQUIRED_FREE_SPACE_MB=$((DESIRED_SWAP_MB + SWAP_SPACE_BUFFER_MB))
 
-        # Check if swapfile exists and is currently active swap
-        SWAPFILE_ACTIVE=$(swapon --show=NAME,SIZE -b | grep "$SWAPFILE" || true)
+        # --- Check Free Disk Space ---
+        # Use df -BM to get Block sizes in 1M and output available space
+        FREE_SPACE_MB=$(df -BM / --output=avail | tail -n 1 | sed 's/M//')
 
-        if [ -n "$SWAPFILE_ACTIVE" ]; then
-             # If swapfile exists and is active, check its size
-             CURRENT_SWAPFILE_SIZE_BYTES=$(echo "$SWAPFILE_ACTIVE" | awk '{print $2}')
-             if [ "$CURRENT_SWAPFILE_SIZE_BYTES" -ge "$SWAP_SIZE_BYTES" ]; then
-                  print_status "Existing swapfile ($SWAPFILE) is already active and large enough (${CURRENT_SWAPFILE_SIZE_BYTES} bytes)."
-             else
-                 print_status "Existing swapfile ($SWAPFILE) is active but too small. Disabling and resizing..."
-                 if ! sudo swapoff "$SWAPFILE"; then print_warning "Failed to disable existing swapfile $SWAPFILE."; fi
-                 print_status "Resizing swapfile..."
-                 if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to resize swapfile with fallocate. Trying dd...";
-                      # Fallback to dd if fallocate fails (less efficient)
+        print_status "Checking free space on root partition (/)..."
+        print_status "Available free space: ${FREE_SPACE_MB}MB"
+        print_status "Required free space for swapfile: ${REQUIRED_FREE_SPACE_MB}MB (Desired: ${DESIRED_SWAP_MB}MB + Buffer: ${SWAP_SPACE_BUFFER_MB}MB)"
+
+        if [ "$FREE_SPACE_MB" -lt "$REQUIRED_FREE_SPACE_MB" ]; then
+            print_error "Insufficient disk space on the root partition (/). Need at least ${REQUIRED_FREE_SPACE_MB}MB, but only ${FREE_SPACE_MB}MB available."
+            print_message "$RED" "Please free up space on your SD card or root filesystem and re-run the script."
+        else
+            print_status "Sufficient disk space available (${FREE_SPACE_MB}MB) to create the swapfile."
+
+            # Check if swapfile exists and is currently active swap
+            SWAPFILE_ACTIVE=$(swapon --show=NAME,SIZE -b | grep "$SWAPFILE" || true)
+
+            if [ -n "$SWAPFILE_ACTIVE" ]; then
+                 # If swapfile exists and is active, check its size
+                 CURRENT_SWAPFILE_SIZE_BYTES=$(echo "$SWAPFILE_ACTIVE" | awk '{print $2}')
+                 if [ "$CURRENT_SWAPFILE_SIZE_BYTES" -ge "$SWAP_SIZE_BYTES" ]; then
+                      print_status "Existing swapfile ($SWAPFILE) is already active and large enough (${CURRENT_SWAPFILE_SIZE_BYTES} bytes)."
+                 else
+                     print_status "Existing swapfile ($SWAPFILE) is active but too small. Disabling and resizing..."
+                     if ! sudo swapoff "$SWAPFILE"; then print_warning "Failed to disable existing swapfile $SWAPFILE."; fi
+                     print_status "Resizing swapfile..."
+                     if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to resize swapfile with fallocate. Trying dd...";
+                          # Fallback to dd if fallocate fails (less efficient)
+                          if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
+                               print_error "Failed to create/resize swapfile using both fallocate and dd."
+                          fi
+                     fi
+                     if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
+                     if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
+                     if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
+                     print_status "Swapfile resized and enabled."
+                 fi
+            elif [ -f "$SWAPFILE" ]; then
+                 # If swapfile exists but is not active swap
+                 print_status "Existing swapfile ($SWAPFILE) found but not active swap. Removing and recreating/resizing."
+                 sudo rm "$SWAPFILE" || print_warning "Failed to remove existing swapfile $SWAPFILE."
+                 print_status "Creating new swapfile..."
+                 if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to create swapfile with fallocate. Trying dd...";
                       if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
-                           print_error "Failed to create/resize swapfile using both fallocate and dd."
+                           print_error "Failed to create swapfile using both fallocate and dd."
                       fi
                  fi
                  if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
                  if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
                  if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
-                 print_status "Swapfile resized and enabled."
-             fi
-        elif [ -f "$SWAPFILE" ]; then
-             # If swapfile exists but is not active swap
-             print_status "Existing swapfile ($SWAPFILE) found but not active swap. Removing and recreating/resizing."
-             sudo rm "$SWAPFILE" || print_warning "Failed to remove existing swapfile $SWAPFILE."
-             print_status "Creating new swapfile..."
-             if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to create swapfile with fallocate. Trying dd...";
-                  if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
-                       print_error "Failed to create swapfile using both fallocate and dd."
-                  fi
-             fi
-             if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
-             if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
-             if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
-             print_status "New swapfile created and enabled."
-        else
-            # If no swapfile exists at all
-            print_status "Creating new swapfile at $SWAPFILE..."
-             if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to create swapfile with fallocate. Trying dd...";
-                  if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
-                       print_error "Failed to create swapfile using both fallocate and dd."
-                  fi
-             fi
-            if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
-            if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
-            if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
-            print_status "New swapfile created and enabled."
-        fi
+                 print_status "New swapfile created and enabled."
+            else
+                # If no swapfile exists at all
+                print_status "Creating new swapfile at $SWAPFILE..."
+                 if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to create swapfile with fallocate. Trying dd...";
+                      if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
+                           print_error "Failed to create swapfile using both fallocate and dd."
+                      fi
+                 fi
+                if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
+                if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
+                if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
+                print_status "New swapfile created and enabled."
+            fi
 
-        # Make swap persistent in fstab
-        print_status "Making swapfile persistent in /etc/fstab..."
-        # Use sed to remove any existing /swapfile line first, then append
-        if sudo sed -i "\@${SWAPFILE}@d" /etc/fstab && echo "$SWAPFILE none swap sw 0 0" | sudo tee -a /etc/fstab; then
-            print_status "$SWAPFILE added to /etc/fstab."
-        else
-             print_warning "Failed to add $SWAPFILE to /etc/fstab. Swap might not be active after reboot."
-        fi
+            # Make swap persistent in fstab
+            print_status "Making swapfile persistent in /etc/fstab..."
+            # Use sed to remove any existing /swapfile line first, then append
+            if sudo sed -i "\@${SWAPFILE}@d" /etc/fstab && echo "$SWAPFILE none swap sw 0 0" | sudo tee -a /etc/fstab; then
+                print_status "$SWAPFILE added to /etc/fstab."
+            else
+                 print_warning "Failed to add $SWAPFILE to /etc/fstab. Swap might not be active after reboot."
+            fi
 
-        print_status "Swap space configuration attempt complete."
-        print_status "Current total swap after changes: $(free -m | awk '/^Swap:/ {print $2}')MB"
+            print_status "Swap space configuration attempt complete."
+            print_status "Current total swap after changes: $(free -m | awk '/^Swap:/ {print $2}')MB"
+        fi # End if [ "$FREE_SPACE_MB" -lt "$REQUIRED_FREE_SPACE_MB" ]
+
     else
         print_status "Current swap space (${CURRENT_SWAP_MB}MB) is sufficient or greater than desired (${DESIRED_SWAP_MB}MB). No changes made."
-    fi
+    fi # End if [ "$CURRENT_SWAP_MB" -lt "$DESIRED_SWAP_MB" ]
 else
     print_status "Swap space check/increase is disabled by configuration (DESIRED_SWAP_MB=0)."
 fi
@@ -471,7 +491,12 @@ if [ -d "$REPO_DIR" ]; then
     else
         # If no local changes, attempt an optimized pull
         print_status "Attempting optimized git pull (--depth 1 --single-branch --set-upstream origin $REPO_BRANCH)..."
-        if ${DOCKER_CMD} --git-dir=.git --work-tree=. pull --depth 1 --single-branch --set-upstream origin "$REPO_BRANCH"; then
+        # Use bash array for git command
+        read -ra GIT_CMD_ARRAY <<< "$DOCKER_CMD" # Assuming DOCKER_CMD is 'docker' or 'sudo docker'
+        GIT_CMD_ARRAY+=(--git-dir=.git --work-tree=.) # Add git options
+        GIT_CMD_ARRAY+=(pull --depth 1 --single-branch --set-upstream origin "$REPO_BRANCH") # Add pull command
+
+        if "${GIT_CMD_ARRAY[@]}"; then
             print_status "Repository updated successfully with optimized pull."
         else
             print_warning "Failed to pull latest changes for $REPO_DIR using optimized pull."
@@ -491,20 +516,25 @@ else
          # Optionally add rm -rf "$REPO_DIR" here if you always want a fresh clone, but that's risky.
     fi
 
-    if git clone --depth 1 --single-branch --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR"; then
+    # Use bash array for git command
+    read -ra GIT_CMD_ARRAY <<< "$(command -v git)" # Get the actual git command path
+    GIT_CMD_ARRAY+=(clone --depth 1 --single-branch --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR") # Add clone command
+
+    if "${GIT_CMD_ARRAY[@]}"; then
         print_status "Repository cloned successfully."
         cd "$REPO_DIR" || print_error "Failed to change directory to $REPO_DIR."
     else
         print_warning "Failed to clone repository $REPO_URL using optimized git clone."
-        print_warning "This could still be a memory issue or network problem."
+        print_warning "This could still be a memory issue, network problem, or the fallback git method didn't work."
         print_message "$YELLOW" "--- Alternative Download Method ---"
         print_message "$YELLOW" "As a fallback, you can try downloading the repository as a ZIP file manually:"
         print_message "$YELLOW" "1. Go to $REPO_URL"
         print_message "$YELLOW" "2. Click 'Code' and select 'Download ZIP'."
-        print_message "$YELLOW" "3. Copy the ZIP file to your Raspberry Pi."
-        print_message "$YELLOW" "4. Extract it: \`unzip raspberry-pi-media-server-main.zip\`"
-        print_message "$YELLOW" "5. Move/rename the extracted folder to '$REPO_DIR'."
-        print_message "$YELLOW" "Then, you can try re-running this script. It will detect the existing directory and skip the clone step."
+        print_message "$YELLOW" "3. Copy the ZIP file to your Raspberry Pi (e.g., using scp)."
+        print_message "$YELLOW" "4. Navigate to your home directory: \`cd ~\`"
+        print_message "$YELLOW" "5. Extract the ZIP file (replace 'repo-name-main.zip' with the actual filename): \`unzip repo-name-main.zip\`"
+        print_message "$YELLOW" "6. The extracted folder will likely be named 'raspberry-pi-media-server-main'. Move/rename it to '$REPO_DIR': \`mv raspberry-pi-media-server-main $REPO_DIR\`"
+        print_message "$YELLOW" "Then, you can try re-running this script. It will detect the existing directory ($REPO_DIR) and skip the clone step."
         print_message "$YELLOW" "-----------------------------------"
         print_error "Repository setup failed. Aborting."
     fi
@@ -521,8 +551,9 @@ for dir in "${REQUIRED_STACK_DIRS[@]}"; do
     if [ ! -d "$dir" ]; then
         print_error "Error: Required directory '$dir' not found in repository ($REPO_DIR). Repository structure is not as expected. Aborting."
     fi
-    if [ ! -f "$dir/docker-compose.yaml" ]; then
-        print_error "Error: docker-compose.yaml not found in '$dir' directory ($REPO_DIR/$dir). Repository structure is not as expected. Aborting."
+    # Note: Checking for both .yml and .yaml
+    if [ ! -f "$dir/docker-compose.yml" ] && [ ! -f "$dir/docker-compose.yaml" ]; then
+        print_error "Error: Neither docker-compose.yml nor docker-compose.yaml found in '$dir' directory ($REPO_DIR/$dir). Repository structure is not as expected. Aborting."
     fi
 done
 print_status "Repository structure verified."
@@ -619,19 +650,29 @@ deploy_stack() {
 
     cd "$compose_dir" || print_error "Failed to change directory to $compose_dir."
 
+    # Determine the correct docker-compose file name (.yml or .yaml)
+    COMPOSE_FILE="docker-compose.yml"
+    if [ ! -f "$COMPOSE_FILE" ] && [ -f "docker-compose.yaml" ]; then
+        COMPOSE_FILE="docker-compose.yaml"
+    fi
+    if [ ! -f "$COMPOSE_FILE" ]; then
+         print_error "Neither docker-compose.yml nor docker-compose.yaml found in $compose_dir. Cannot deploy."
+    fi
+    print_status "Using compose file: $COMPOSE_FILE"
+
     # Validate docker-compose file syntax
-    print_status "Validating docker-compose configuration for $stack_name..."
+    print_status "Validating docker-compose configuration for $stack_name using $COMPOSE_FILE..."
     # Use bash array to handle potential sudo in DOCKER_COMPOSE_CMD
     read -ra COMPOSE_CMD_ARRAY <<< "$DOCKER_COMPOSE_CMD"
-    if ! "${COMPOSE_CMD_ARRAY[@]}" config >/dev/null 2>&1; then
-        print_error "Docker-compose configuration for $stack_name is invalid. Check syntax in $compose_dir/docker-compose.yaml"
+    if ! "${COMPOSE_CMD_ARRAY[@]}" -f "$COMPOSE_FILE" config >/dev/null 2>&1; then
+        print_error "Docker-compose configuration for $stack_name is invalid. Check syntax in $compose_dir/$COMPOSE_FILE"
     fi
     print_status "Docker-compose configuration for $stack_name is valid."
 
     # Deploy containers
-    print_status "Running '${DOCKER_COMPOSE_CMD} up -d' for $stack_name stack..."
+    print_status "Running '${DOCKER_COMPOSE_CMD} up -d -f $COMPOSE_FILE' for $stack_name stack..."
      # Use bash array to handle potential sudo
-    if "${COMPOSE_CMD_ARRAY[@]}" up -d --remove-orphans; then # Add --remove-orphans to clean up old containers
+    if "${COMPOSE_CMD_ARRAY[@]}" -f "$COMPOSE_FILE" up -d --remove-orphans; then # Add --remove-orphans to clean up old containers
         print_message "$GREEN" "✅ $stack_name stack deployed successfully!"
         # Optional: Wait a moment for containers to start (adjust as needed)
         # sleep 10
@@ -639,7 +680,7 @@ deploy_stack() {
         print_message "$RED" "❌ Failed to deploy $stack_name stack."
         print_warning "Checking logs for $stack_name stack containers..."
         # Show logs for services in this compose file
-        if "${COMPOSE_CMD_ARRAY[@]}" logs; then
+        if "${COMPOSE_CMD_ARRAY[@]}" -f "$COMPOSE_FILE" logs; then
              echo "See logs above or in $LOG_FILE for details on $stack_name failure."
         else
             echo "Could not retrieve docker-compose logs for $stack_name. Check $LOG_FILE for details."
@@ -734,6 +775,8 @@ echo ""
 # Create a simple README file
 README_PATH="$HOME/MEDIA_SERVER_SETUP_README.txt"
 print_status "Creating summary README file at $README_PATH..."
+# Get current swap size again, just in case something changed
+FINAL_SWAP_MB=$(free -m | awk '/^Swap:/ {print $2}' || echo "Unknown")
 cat <<EOF > "$README_PATH"
 Raspberry Pi Media Server Setup Summary
 
@@ -742,7 +785,7 @@ Log file: $LOG_FILE
 Repository directory: $REPO_DIR
 Media/Data directory: $DATA_PATH
 User for Docker: $USER_NAME (UID: $PUID, GID: $PGID)
-Swap configured to: $(free -m | awk '/^Swap:/ {print $2}')MB
+Swap configured to: ${FINAL_SWAP_MB}MB
 
 Potential Service Access URLs (using primary IP: $PRIMARY_IP):
 
