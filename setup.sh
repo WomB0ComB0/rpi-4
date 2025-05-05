@@ -7,6 +7,9 @@
 # Raspberry Pi using Docker containers based on the LucasACH/raspberry-pi-media-server
 # repository. It includes components like Jellyfin, Deluge, Radarr, Sonarr,
 # Jackett, and monitoring tools (Grafana).
+#
+# Addresses git clone issues on low-RAM devices by using shallow/single-branch
+# clone and suggests checking/increasing swap.
 #=============================================================================
 
 # --- Configuration ---
@@ -30,6 +33,10 @@ DUCKDNS_TOKEN="your-duckdns-token" # Your DuckDNS token - REQUIRED if using Duck
 MYSQL_USER="npm"                   # MySQL user for Nginx Proxy Manager database
 MYSQL_PASSWORD="npm_password"      # MySQL password for Nginx Proxy Manager database - CHANGE THIS!
 
+# Swap Configuration (Optional but Recommended for 1GB RAM)
+# Set desired swap size in MB. Script will add/increase if current total swap is less.
+DESIRED_SWAP_MB=1024 # Set to 0 to skip swap check/increase
+
 # --- Terminal colors ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -42,6 +49,7 @@ SCRIPT_START_TIME=$(date +"%Y-%m-%d_%H-%M-%S")
 LOG_FILE="$HOME/media_server_setup_$SCRIPT_START_TIME.log"
 REPO_DIR="$HOME/raspberry-pi-media-server"
 REPO_URL="https://github.com/LucasACH/raspberry-pi-media-server.git"
+REPO_BRANCH="main" # Assume main branch for shallow clone
 
 # --- Functions ---
 
@@ -49,6 +57,9 @@ REPO_URL="https://github.com/LucasACH/raspberry-pi-media-server.git"
 print_message() {
     local color="$1"
     local message="$2"
+    # Ensure log directory exists before teeing
+    LOG_DIR=$(dirname "$LOG_FILE")
+    mkdir -p "$LOG_DIR" 2>/dev/null || true # Ignore errors here, will catch later if needed
     echo -e "${color}${message}${NC}" | tee -a "$LOG_FILE"
 }
 
@@ -114,11 +125,9 @@ print_message "$BLUE" "Script started at $SCRIPT_START_TIME"
 echo ""
 
 # --- Setup Logging ---
-# Ensure log directory exists if not in home
+# Ensure log directory exists before teeing
 LOG_DIR=$(dirname "$LOG_FILE")
-if [ ! -d "$LOG_DIR" ]; then
-    mkdir -p "$LOG_DIR" || print_error "Failed to create log directory $LOG_DIR"
-fi
+mkdir -p "$LOG_DIR" || print_error "Failed to create log directory $LOG_DIR"
 print_status "Logs will be saved to $LOG_FILE"
 # Redirect stdout and stderr to tee, which writes to both console and log file
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -144,7 +153,7 @@ fi
 
 # Check for essential commands
 print_status "Checking for essential commands..."
-ESSENTIAL_COMMANDS=("curl" "git" "wget" "awk" "grep" "sed" "tee")
+ESSENTIAL_COMMANDS=("curl" "git" "wget" "awk" "grep" "sed" "tee" "unzip") # Added unzip
 for cmd in "${ESSENTIAL_COMMANDS[@]}"; do
     if ! command_exists "$cmd"; then
         print_error "Essential command '$cmd' not found. Please install it."
@@ -171,11 +180,98 @@ if [ "$ENABLE_WEB_STACK" = true ]; then
          print_warning "MySQL password for Nginx Proxy Manager is still the default 'npm_password'. CHANGE THIS!"
     fi
 else
-    print_warning "Web stack deployment is disabled. Services relying on it (like Nginx Proxy Manager for reverse proxy) will not be deployed."
+    print_status "Web stack deployment is disabled."
 fi
 
 print_message "$GREEN" "Starting installation process..."
 echo ""
+
+# --- Swap Space Check and Increase ---
+print_section "SWAP SPACE MANAGEMENT"
+if [ "$DESIRED_SWAP_MB" -gt 0 ]; then
+    print_status "Checking current swap space..."
+    CURRENT_SWAP_KB=$(free -k | awk '/^Swap:/ {print $2}')
+    CURRENT_SWAP_MB=$((CURRENT_SWAP_KB / 1024))
+
+    print_status "Current total swap: ${CURRENT_SWAP_MB}MB"
+    print_status "Desired total swap: ${DESIRED_SWAP_MB}MB"
+
+    if [ "$CURRENT_SWAP_MB" -lt "$DESIRED_SWAP_MB" ]; then
+        print_warning "Current swap (${CURRENT_SWAP_MB}MB) is less than desired (${DESIRED_SWAP_MB}MB)."
+        print_status "Attempting to increase swap space by creating/extending a swap file..."
+
+        SWAPFILE="/swapfile"
+        SWAP_SIZE_BYTES=$((DESIRED_SWAP_MB * 1024 * 1024)) # Convert MB to Bytes
+
+        # Check if swapfile exists and is currently active swap
+        SWAPFILE_ACTIVE=$(swapon --show=NAME,SIZE -b | grep "$SWAPFILE" || true)
+
+        if [ -n "$SWAPFILE_ACTIVE" ]; then
+             # If swapfile exists and is active, check its size
+             CURRENT_SWAPFILE_SIZE_BYTES=$(echo "$SWAPFILE_ACTIVE" | awk '{print $2}')
+             if [ "$CURRENT_SWAPFILE_SIZE_BYTES" -ge "$SWAP_SIZE_BYTES" ]; then
+                  print_status "Existing swapfile ($SWAPFILE) is already active and large enough (${CURRENT_SWAPFILE_SIZE_BYTES} bytes)."
+             else
+                 print_status "Existing swapfile ($SWAPFILE) is active but too small. Disabling and resizing..."
+                 if ! sudo swapoff "$SWAPFILE"; then print_warning "Failed to disable existing swapfile $SWAPFILE."; fi
+                 print_status "Resizing swapfile..."
+                 if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to resize swapfile with fallocate. Trying dd...";
+                      # Fallback to dd if fallocate fails (less efficient)
+                      if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
+                           print_error "Failed to create/resize swapfile using both fallocate and dd."
+                      fi
+                 fi
+                 if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
+                 if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
+                 if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
+                 print_status "Swapfile resized and enabled."
+             fi
+        elif [ -f "$SWAPFILE" ]; then
+             # If swapfile exists but is not active swap
+             print_status "Existing swapfile ($SWAPFILE) found but not active swap. Removing and recreating/resizing."
+             sudo rm "$SWAPFILE" || print_warning "Failed to remove existing swapfile $SWAPFILE."
+             print_status "Creating new swapfile..."
+             if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to create swapfile with fallocate. Trying dd...";
+                  if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
+                       print_error "Failed to create swapfile using both fallocate and dd."
+                  fi
+             fi
+             if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
+             if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
+             if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
+             print_status "New swapfile created and enabled."
+        else
+            # If no swapfile exists at all
+            print_status "Creating new swapfile at $SWAPFILE..."
+             if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to create swapfile with fallocate. Trying dd...";
+                  if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
+                       print_error "Failed to create swapfile using both fallocate and dd."
+                  fi
+             fi
+            if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
+            if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
+            if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
+            print_status "New swapfile created and enabled."
+        fi
+
+        # Make swap persistent in fstab
+        print_status "Making swapfile persistent in /etc/fstab..."
+        # Use sed to remove any existing /swapfile line first, then append
+        if sudo sed -i "\@${SWAPFILE}@d" /etc/fstab && echo "$SWAPFILE none swap sw 0 0" | sudo tee -a /etc/fstab; then
+            print_status "$SWAPFILE added to /etc/fstab."
+        else
+             print_warning "Failed to add $SWAPFILE to /etc/fstab. Swap might not be active after reboot."
+        fi
+
+        print_status "Swap space configuration attempt complete."
+        print_status "Current total swap after changes: $(free -m | awk '/^Swap:/ {print $2}')MB"
+    else
+        print_status "Current swap space (${CURRENT_SWAP_MB}MB) is sufficient or greater than desired (${DESIRED_SWAP_MB}MB). No changes made."
+    fi
+else
+    print_status "Swap space check/increase is disabled by configuration (DESIRED_SWAP_MB=0)."
+fi
+
 
 # --- Update and Upgrade the system ---
 print_section "SYSTEM UPDATE"
@@ -192,27 +288,16 @@ print_status "System update and upgrade complete."
 # --- Install required packages ---
 print_section "INSTALLING REQUIRED PACKAGES"
 print_status "Installing essential packages..."
-ESSENTIAL_APT_PACKAGES="apt-transport-https ca-certificates curl gnupg lsb-release unzip jq" # Added jq
+# Added jq, unzip, git if not already there
+ESSENTIAL_APT_PACKAGES="apt-transport-https ca-certificates curl gnupg lsb-release jq git unzip"
 for pkg in $ESSENTIAL_APT_PACKAGES; do
-    if ! command_exists "$pkg" && [ "$pkg" != "apt-transport-https" ] && [ "$pkg" != "ca-certificates" ] && [ "$pkg" != "lsb-release" ] && [ "$pkg" != "gnupg" ]; then # Check if primary command exists
-        print_status "Checking if $pkg is installed..."
-        if dpkg -s "$pkg" &>/dev/null; then
-             print_status "$pkg is already installed."
-        else
-            print_status "Installing $pkg..."
-            if ! sudo apt install -y "$pkg"; then
-                print_warning "Failed to install package: $pkg. Script may continue but might have issues."
-            fi
-        fi
+    # Check if package is installed using dpkg, which is more reliable than command_exists for non-command packages
+    if dpkg -s "$pkg" &>/dev/null; then
+         print_status "$pkg is already installed."
     else
-        # Handle packages that don't have a primary command or check anyway
-        if dpkg -s "$pkg" &>/dev/null; then
-             print_status "$pkg is already installed."
-        else
-            print_status "Installing $pkg..."
-            if ! sudo apt install -y "$pkg"; then
-                print_warning "Failed to install package: $pkg. Script may continue but might have issues."
-            fi
+        print_status "Installing $pkg..."
+        if ! sudo apt install -y "$pkg"; then
+            print_warning "Failed to install package: $pkg. Script may continue but might have issues."
         fi
     fi
 done
@@ -261,17 +346,46 @@ else
     print_status "Installing Docker Compose (v1) via apt..."
     # Install v1 via apt, which is common on RPi OS
     if ! sudo apt install -y docker-compose; then
+        # Fallback to manual install if apt fails (less preferred)
         print_warning "Failed to install docker-compose via apt. Attempting manual install (might fail on some architectures)."
         # Fallback: Manual install of latest v1 compose (might need architecture checks)
         COMPOSE_VERSION=$(git ls-remote https://github.com/docker/compose --tags | grep -oP 'v\K\d+\.\d+\.\d+' | head -1)
         print_status "Attempting to download Docker Compose v$COMPOSE_VERSION..."
-        if ! sudo curl -L "https://github.com/docker/compose/releases/download/v$COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose; then
-             print_error "Failed to download Docker Compose binary."
+        # Check architecture for manual download
+        ARCH=$(uname -m)
+        case "$ARCH" in
+            x86_64) MANUAL_ARCH="x86_64" ;;
+            aarch64) MANUAL_ARCH="aarch64" ;; # arm64
+            armv7l) MANUAL_ARCH="armv7l" ;;  # armhf (common on RPi)
+            *)
+                print_warning "Unsupported architecture '$ARCH' for manual Docker Compose download."
+                print_warning "Manual installation skipped."
+                MANUAL_INSTALL_SUCCESS=false
+                ;;
+        esac
+
+        if [ -n "$MANUAL_ARCH" ]; then
+             MANUAL_URL="https://github.com/docker/compose/releases/download/v$COMPOSE_VERSION/docker-compose-$(uname -s)-${MANUAL_ARCH}"
+             print_status "Downloading from: $MANUAL_URL"
+             if sudo curl -L "$MANUAL_URL" -o /usr/local/bin/docker-compose; then
+                if sudo chmod +x /usr/local/bin/docker-compose; then
+                     print_status "Manual Docker Compose v1 installation complete at /usr/local/bin/docker-compose."
+                     MANUAL_INSTALL_SUCCESS=true
+                else
+                     print_warning "Failed to make Docker Compose binary executable."
+                     MANUAL_INSTALL_SUCCESS=false
+                fi
+             else
+                 print_warning "Failed to download Docker Compose binary from $MANUAL_URL."
+                 MANUAL_INSTALL_SUCCESS=false
+             fi
+        else
+             MANUAL_INSTALL_SUCCESS=false # Set to false if arch was unsupported
         fi
-        if ! sudo chmod +x /usr/local/bin/docker-compose; then
-             print_error "Failed to make Docker Compose binary executable."
+
+        if [ "$MANUAL_INSTALL_SUCCESS" != true ]; then
+            print_error "Docker Compose installation failed via both apt and manual methods. Cannot proceed."
         fi
-        print_status "Manual Docker Compose v1 installation complete."
     fi
 fi
 print_status "Docker Compose installation attempt complete."
@@ -288,11 +402,23 @@ else
 fi
 
 # Verify docker access for the user (will still require log out/in)
-print_status "Verifying docker access (requires re-login)..."
-if groups "$USER_NAME" | grep -q '\bdocker\b'; then
-    print_status "User '$USER_NAME' is in the 'docker' group."
+print_status "Verifying docker command access for user '$USER_NAME' (may require re-login)..."
+if docker ps > /dev/null 2>&1; then
+     print_status "Docker commands likely work without sudo for user '$USER_NAME' after re-login."
+     DOCKER_COMPOSE_CMD=$(command -v docker-compose || command -v docker compose) # Determine the command (v1 or v2)
+     DOCKER_CMD="docker"
+     print_status "Using docker-compose command: '$DOCKER_COMPOSE_CMD'"
 else
-    print_warning "User '$USER_NAME' is NOT yet in the 'docker' group (might need re-login)."
+     print_warning "Docker commands require 'sudo' for user '$USER_NAME'. Re-login is likely required."
+     print_status "Proceeding by prepending 'sudo' to docker and docker-compose commands."
+     DOCKER_COMPOSE_CMD="sudo $(command -v docker-compose || command -v docker compose)" # Use sudo and determine command
+     DOCKER_CMD="sudo docker"
+     print_status "Using docker-compose command: '$DOCKER_COMPOSE_CMD' (with sudo)"
+fi
+
+# Final check for docker-compose command existence after potential manual install
+if ! command_exists docker-compose && ! (command_exists docker && docker compose version &>/dev/null); then
+     print_error "Neither 'docker-compose' (v1) nor 'docker compose' (v2) command found after installation attempts."
 fi
 
 
@@ -308,39 +434,11 @@ else
         # Give it a moment to become fully ready
         sleep 5
         if ! sudo systemctl is-active --quiet docker; then
-             print_error "Docker service failed to start or is not stable. Check 'sudo systemctl status docker'."
+             print_error "Docker service failed to start or is not stable. Check 'sudo systemctl status docker' and $LOG_FILE."
         fi
     else
         print_error "Failed to start Docker service. Check 'sudo systemctl status docker' and $LOG_FILE for details."
     fi
-fi
-
-# Check if the user can run docker commands (might fail if not re-logged in)
-print_status "Testing docker command access for user '$USER_NAME' (may require re-login)..."
-if docker ps > /dev/null 2>&1; then
-     print_status "Docker commands work without sudo for user '$USER_NAME'."
-else
-     print_warning "Docker commands require 'sudo' for user '$USER_NAME'. Re-login may be required."
-     print_status "Proceeding by prepending 'sudo' to docker-compose commands in deployment step."
-     DOCKER_COMPOSE_CMD="sudo docker-compose" # Use sudo for compose commands
-     DOCKER_CMD="sudo docker" # Use sudo for other docker commands
-fi
-
-# If DOCKER_COMPOSE_CMD is not set, use standard command
-if [ -z "$DOCKER_COMPOSE_CMD" ]; then
-    if command_exists docker-compose; then
-        DOCKER_COMPOSE_CMD="docker-compose"
-    elif command_exists docker && docker compose version &>/dev/null; then
-        DOCKER_COMPOSE_CMD="docker compose" # Use v2 command if v1 not found
-        print_status "Using Docker Compose v2 ('docker compose') command."
-    else
-        print_error "Neither 'docker-compose' (v1) nor 'docker compose' (v2) command found."
-    fi
-fi
-
-# If DOCKER_CMD is not set, use standard command
-if [ -z "$DOCKER_CMD" ]; then
-    DOCKER_CMD="docker"
 fi
 
 
@@ -349,31 +447,66 @@ print_section "BACKUP"
 backup_config
 
 # --- Clone or update the repository ---
-print_section "REPOSITORY SETUP"
-print_status "Setting up media server repository ($REPO_URL) in $REPO_DIR..."
+print_section "REPOSITORY SETUP ($REPO_URL)"
+print_status "Setting up media server repository ($REPO_URL, branch: $REPO_BRANCH) in $REPO_DIR..."
 
 if [ -d "$REPO_DIR" ]; then
-    print_status "Existing repository found at $REPO_DIR. Attempting to update..."
+    print_status "Existing repository found at $REPO_DIR. Attempting to update with optimized pull..."
     cd "$REPO_DIR" || print_error "Failed to change directory to $REPO_DIR."
     # Check for local changes first
     if [ -n "$(${DOCKER_CMD} --git-dir=.git --work-tree=. status --porcelain)" ]; then
         print_warning "Local changes detected in $REPO_DIR. Stash or commit them before pulling."
-        print_warning "Skipping git pull to avoid conflicts."
-    else
-        if ${DOCKER_CMD} --git-dir=.git --work-tree=. pull; then
-            print_status "Repository updated successfully."
+        print_warning "Skipping git pull to avoid conflicts. Using existing code."
+        # Check if it's already a shallow clone of the correct branch
+        IS_SHALLOW=$(${DOCKER_CMD} --git-dir=.git rev-parse --is-shallow-repository || echo "false")
+        CURRENT_BRANCH=$(${DOCKER_CMD} --git-dir=.git rev-parse --abbrev-ref HEAD || echo "unknown")
+
+        if [ "$IS_SHALLOW" = "true" ] && [ "$CURRENT_BRANCH" = "$REPO_BRANCH" ]; then
+            print_status "Existing repo is already a shallow clone of the target branch."
         else
-            print_warning "Failed to pull latest changes for $REPO_DIR. Continuing with existing code."
+            print_warning "Existing repo is NOT a shallow clone of '$REPO_BRANCH' or has local changes."
+            print_warning "If deployment fails, consider manually removing '$REPO_DIR' and re-running the script for a fresh, optimized clone."
+        fi
+
+    else
+        # If no local changes, attempt an optimized pull
+        print_status "Attempting optimized git pull (--depth 1 --single-branch --set-upstream origin $REPO_BRANCH)..."
+        if ${DOCKER_CMD} --git-dir=.git --work-tree=. pull --depth 1 --single-branch --set-upstream origin "$REPO_BRANCH"; then
+            print_status "Repository updated successfully with optimized pull."
+        else
+            print_warning "Failed to pull latest changes for $REPO_DIR using optimized pull."
+            print_warning "This might happen if the existing clone is not shallow or on the wrong branch."
+            print_warning "Using the existing code in '$REPO_DIR'. If deployment fails, consider manually removing '$REPO_DIR' and re-running the script for a fresh, optimized clone."
         fi
     fi
 else
-    print_status "Cloning repository $REPO_URL to $REPO_DIR..."
+    # Perform an optimized clone (shallow and single branch)
+    print_status "Cloning repository $REPO_URL to $REPO_DIR using optimized clone (--depth 1 --single-branch --branch $REPO_BRANCH)..."
     cd "$HOME" || print_error "Failed to change directory to $HOME."
-    if git clone "$REPO_URL" "$REPO_DIR"; then
+
+    # Check if the target directory is empty or doesn't exist
+    if [ -e "$REPO_DIR" ] && [ -n "$(ls -A "$REPO_DIR" 2>/dev/null)" ]; then
+         print_warning "Target directory $REPO_DIR exists and is not empty. This is unexpected as part of a fresh clone attempt."
+         print_warning "Proceeding with clone, but it might fail or merge."
+         # Optionally add rm -rf "$REPO_DIR" here if you always want a fresh clone, but that's risky.
+    fi
+
+    if git clone --depth 1 --single-branch --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR"; then
         print_status "Repository cloned successfully."
         cd "$REPO_DIR" || print_error "Failed to change directory to $REPO_DIR."
     else
-        print_error "Failed to clone repository $REPO_URL."
+        print_warning "Failed to clone repository $REPO_URL using optimized git clone."
+        print_warning "This could still be a memory issue or network problem."
+        print_message "$YELLOW" "--- Alternative Download Method ---"
+        print_message "$YELLOW" "As a fallback, you can try downloading the repository as a ZIP file manually:"
+        print_message "$YELLOW" "1. Go to $REPO_URL"
+        print_message "$YELLOW" "2. Click 'Code' and select 'Download ZIP'."
+        print_message "$YELLOW" "3. Copy the ZIP file to your Raspberry Pi."
+        print_message "$YELLOW" "4. Extract it: \`unzip raspberry-pi-media-server-main.zip\`"
+        print_message "$YELLOW" "5. Move/rename the extracted folder to '$REPO_DIR'."
+        print_message "$YELLOW" "Then, you can try re-running this script. It will detect the existing directory and skip the clone step."
+        print_message "$YELLOW" "-----------------------------------"
+        print_error "Repository setup failed. Aborting."
     fi
 fi
 
@@ -488,14 +621,17 @@ deploy_stack() {
 
     # Validate docker-compose file syntax
     print_status "Validating docker-compose configuration for $stack_name..."
-    if ! ${DOCKER_COMPOSE_CMD} config >/dev/null 2>&1; then
+    # Use bash array to handle potential sudo in DOCKER_COMPOSE_CMD
+    read -ra COMPOSE_CMD_ARRAY <<< "$DOCKER_COMPOSE_CMD"
+    if ! "${COMPOSE_CMD_ARRAY[@]}" config >/dev/null 2>&1; then
         print_error "Docker-compose configuration for $stack_name is invalid. Check syntax in $compose_dir/docker-compose.yml"
     fi
     print_status "Docker-compose configuration for $stack_name is valid."
 
     # Deploy containers
     print_status "Running '${DOCKER_COMPOSE_CMD} up -d' for $stack_name stack..."
-    if ${DOCKER_COMPOSE_CMD} up -d --remove-orphans; then # Add --remove-orphans to clean up old containers
+     # Use bash array to handle potential sudo
+    if "${COMPOSE_CMD_ARRAY[@]}" up -d --remove-orphans; then # Add --remove-orphans to clean up old containers
         print_message "$GREEN" "✅ $stack_name stack deployed successfully!"
         # Optional: Wait a moment for containers to start (adjust as needed)
         # sleep 10
@@ -503,7 +639,7 @@ deploy_stack() {
         print_message "$RED" "❌ Failed to deploy $stack_name stack."
         print_warning "Checking logs for $stack_name stack containers..."
         # Show logs for services in this compose file
-        if ${DOCKER_COMPOSE_CMD} logs; then
+        if "${COMPOSE_CMD_ARRAY[@]}" logs; then
              echo "See logs above or in $LOG_FILE for details on $stack_name failure."
         else
             echo "Could not retrieve docker-compose logs for $stack_name. Check $LOG_FILE for details."
@@ -512,7 +648,7 @@ deploy_stack() {
         exit 1
     fi
 
-    # Go back to repo root or home
+    # Go back to repo root
     cd "$REPO_DIR" || print_error "Failed to change directory back to $REPO_DIR."
 }
 
@@ -555,7 +691,9 @@ if [ "$ENABLE_WEB_STACK" = true ]; then
     if [ "$DUCKDNS_SUBDOMAIN" != "your-subdomain" ] && [ "$DUCKDNS_TOKEN" != "your-duckdns-token" ] && command_exists curl; then
         echo ""
         print_message "$BLUE" "Testing DuckDNS update:"
-        curl "https://www.duckdns.org/update?domains=$DUCKDNS_SUBDOMAIN&token=$DUCKDNS_TOKEN&ip="
+        # Use bash array for curl command
+        read -ra CURL_CMD_ARRAY <<< "$(command -v curl)"
+        "${CURL_CMD_ARRAY[@]}" "https://www.duckdns.org/update?domains=$DUCKDNS_SUBDOMAIN&token=$DUCKDNS_TOKEN&ip="
         echo ""
         print_message "$GREEN" "DuckDNS update attempted. Verify it updated correctly via duckdns.org."
     fi
@@ -582,7 +720,7 @@ print_message "$RED" "⚠️  SECURITY ALERT: Change all default passwords immed
 print_message "$RED" "==================================================="
 echo ""
 print_message "$YELLOW" "Next Steps:"
-echo "1. IMPORTANT: If you weren't prompted for sudo password for 'docker ps', you must LOG OUT AND LOG BACK IN for the docker group changes to take effect."
+echo "1. IMPORTANT: If you needed 'sudo' for Docker commands during this script, you must LOG OUT AND LOG BACK IN for the docker group changes to take effect and run commands without sudo."
 echo "2. Access the services listed above."
 echo "3. Configure storage paths within Jellyfin, Radarr, Sonarr, Deluge etc. to point to your $DATA_PATH subdirectories."
 echo "4. Configure Jackett indexers."
@@ -604,6 +742,7 @@ Log file: $LOG_FILE
 Repository directory: $REPO_DIR
 Media/Data directory: $DATA_PATH
 User for Docker: $USER_NAME (UID: $PUID, GID: $PGID)
+Swap configured to: $(free -m | awk '/^Swap:/ {print $2}')MB
 
 Potential Service Access URLs (using primary IP: $PRIMARY_IP):
 
