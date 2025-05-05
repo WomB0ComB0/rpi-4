@@ -521,8 +521,8 @@ for dir in "${REQUIRED_STACK_DIRS[@]}"; do
     if [ ! -d "$dir" ]; then
         print_error "Error: Required directory '$dir' not found in repository ($REPO_DIR). Repository structure is not as expected. Aborting."
     fi
-    if [ ! -f "$dir/docker-compose.yml" ]; then
-        print_error "Error: docker-compose.yml not found in '$dir' directory ($REPO_DIR/$dir). Repository structure is not as expected. Aborting."
+    if [ ! -f "$dir/docker-compose.yaml" ]; then
+        print_error "Error: docker-compose.yaml not found in '$dir' directory ($REPO_DIR/$dir). Repository structure is not as expected. Aborting."
     fi
 done
 print_status "Repository structure verified."
@@ -624,7 +624,7 @@ deploy_stack() {
     # Use bash array to handle potential sudo in DOCKER_COMPOSE_CMD
     read -ra COMPOSE_CMD_ARRAY <<< "$DOCKER_COMPOSE_CMD"
     if ! "${COMPOSE_CMD_ARRAY[@]}" config >/dev/null 2>&1; then
-        print_error "Docker-compose configuration for $stack_name is invalid. Check syntax in $compose_dir/docker-compose.yml"
+        print_error "Docker-compose configuration for $stack_name is invalid. Check syntax in $compose_dir/docker-compose.yaml"
     fi
     print_status "Docker-compose configuration for $stack_name is valid."
 
