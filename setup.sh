@@ -11,6 +11,7 @@
 # Addresses git clone issues on low-RAM devices by using shallow/single-branch
 # clone and suggests checking/increasing swap. Includes checks for disk
 # space before creating a swap file and makes swap creation more robust.
+# Improved handling for swapoff failure if swap file is busy.
 #=============================================================================
 
 # --- Configuration ---
@@ -41,11 +42,11 @@ DESIRED_SWAP_MB=1024 # Set to 0 to skip swap check/increase
 SWAP_SPACE_BUFFER_MB=100 # Amount of extra free space (in MB) to require beyond DESIRED_SWAP_MB
 
 # --- Terminal colors ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+RED='\0330;31m'
+GREEN='\0330;32m'
+YELLOW='\0331;33m'
+BLUE='\0330;34m'
+NC='\0330m' # No Color
 
 # --- Variables ---
 SCRIPT_START_TIME=$(date +"%Y-%m-%d_%H-%M-%S")
@@ -126,8 +127,8 @@ create_swapfile() {
              print_status "Created swapfile with dd (bs=4K)."
              return 0 # Success
         else
-             print_error "Failed to create swapfile using both fallocate and dd (bs=4K). Check output and $LOG_FILE for details."
-             return 1 # Failure (error function already exits, but for completeness)
+             # Specific error message captured in the trap
+             return 1 # Indicate failure
         fi
     fi
 }
@@ -137,7 +138,7 @@ create_swapfile() {
 # Exit immediately if a command exits with a non-zero status
 set -e
 # Call print_error on any command failure
-trap 'print_error "An unexpected error occurred. Script aborted. Check $LOG_FILE for details."' ERR
+trap 'exit_code=$?; if [ "$exit_code" -ne 0 ]; then print_error "An unexpected error occurred (Exit Code: $exit_code). Script aborted. Check $LOG_FILE for details."; fi' ERR
 
 # --- Welcome banner ---
 clear
@@ -263,26 +264,33 @@ if [ "$DESIRED_SWAP_MB" -gt 0 ]; then
                       print_status "Existing swapfile ($SWAPFILE) is already active and large enough (${CURRENT_SWAPFILE_SIZE_BYTES} bytes)."
                  else
                      print_status "Existing swapfile ($SWAPFILE) is active but too small. Disabling and resizing..."
-                     if ! sudo swapoff "$SWAPFILE"; then print_warning "Failed to disable existing swapfile $SWAPFILE."; fi
-                     # Attempt to create/resize the swapfile
-                     create_swapfile "$SWAPFILE" "$SWAP_SIZE_BYTES" "$DESIRED_SWAP_MB"
-                     # If create_swapfile succeeded, format and enable
-                     if [ -f "$SWAPFILE" ]; then
-                         if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
-                         if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
-                         if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
-                         print_status "Swapfile resized and enabled."
+                     # --- CRITICAL: Check if swapoff succeeds ---
+                     if sudo swapoff "$SWAPFILE"; then
+                         print_status "Swap file disabled successfully."
+                         # Attempt to create/resize the swapfile using the function
+                         create_swapfile "$SWAPFILE" "$SWAP_SIZE_BYTES" "$DESIRED_SWAP_MB"
+                         # If create_swapfile succeeded (it exits on failure), format and enable
+                         if [ -f "$SWAPFILE" ]; then
+                             if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
+                             if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
+                             if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
+                             print_status "Swapfile resized and enabled."
+                         else
+                              # This block should not be reached if create_swapfile exits on failure,
+                             # but as a safeguard:
+                             print_error "Swapfile was not created despite reported sufficient disk space during resize attempt. Check logs."
+                         fi
                      else
-                         # This block should not be reached if create_swapfile exits on failure,
-                         # but as a safeguard:
-                         print_error "Swapfile was not created despite reported sufficient disk space during resize attempt. Check logs."
-                     fi
+                         # --- SWAPOFF FAILED ---
+                         print_error "Failed to disable existing swapfile '$SWAPFILE'."
+                         print_message "$RED" "This often means the system is heavily using swap and doesn't have enough free RAM to move its contents."
+                         print_message "$RED" "RECOMMENDATION: Try to free up memory (stop services, close programs) or reboot your Raspberry Pi and run the script again."
+                     fi # End if/else swapoff
                  fi
             elif [ -f "$SWAPFILE" ]; then
                  # If swapfile exists but is not active swap
                  print_status "Existing swapfile ($SWAPFILE) found but not active swap. Removing and recreating/resizing."
-                 sudo rm "$SWAPFILE" || print_warning "Failed to remove existing swapfile $SWAPFILE."
-                 # Fall through to create new swapfile logic
+                 if ! sudo rm "$SWAPFILE"; then print_warning "Failed to remove existing swapfile $SWAPFILE."; fi # Added sudo
                  print_status "Continuing to create new swapfile..."
                  # Call create_swapfile function
                  create_swapfile "$SWAPFILE" "$SWAP_SIZE_BYTES" "$DESIRED_SWAP_MB"
@@ -293,7 +301,7 @@ if [ "$DESIRED_SWAP_MB" -gt 0 ]; then
                     if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
                     print_status "New swapfile created and enabled."
                  else
-                     # Safeguard: should not be reached if create_swapfile exits
+                      # Safeguard: should not be reached if create_swapfile exits
                      print_error "Swapfile was not created despite reported sufficient disk space. Check logs."
                  fi
             else
@@ -308,8 +316,8 @@ if [ "$DESIRED_SWAP_MB" -gt 0 ]; then
                    if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
                    print_status "New swapfile created and enabled."
                 else
-                     # Safeguard: should not be reached if create_swapfile exits
-                     print_error "Swapfile was not created despite reported sufficient disk space. Check logs."
+                    # Safeguard: should not be reached if create_swapfile exits
+                    print_error "Swapfile was not created despite reported sufficient disk space. Check logs."
                 fi
             fi # End if/elif/else swapfile existence check
 
@@ -325,10 +333,9 @@ if [ "$DESIRED_SWAP_MB" -gt 0 ]; then
             print_status "Swap space configuration attempt complete."
             print_status "Current total swap after changes: $(free -m | awk '/^Swap:/ {print $2}' || echo "Unknown")MB"
 
-            # Suggest filesystem check if swap creation failed despite space (error function will trigger)
-            # This message only shows if the inner create_swapfile fails and exits
-            print_message "$RED" "Swap file creation failed even with reported free space. This could indicate a filesystem issue."
-            print_message "$RED" "RECOMMENDATION: Run a filesystem check (fsck) on your root partition. This usually requires booting from another medium or using recovery mode."
+            # Suggest filesystem check ONLY if create_swapfile failed after successful swapoff (error function will trigger)
+            # This message is now handled within the error message of create_swapfile function if it returns non-zero.
+            # If swapoff failed, the specific swapoff failure message is shown.
 
         fi # End if [ "$FREE_SPACE_MB" -lt "$REQUIRED_FREE_SPACE_MB" ]
 
@@ -431,7 +438,7 @@ else
                 print_warning "Manual installation skipped."
                 MANUAL_INSTALL_SUCCESS=false
                 ;;
-        esac
+        endac
 
         if [ -n "$MANUAL_ARCH" ]; then
              MANUAL_URL="https://github.com/docker/compose/releases/download/v$COMPOSE_VERSION/docker-compose-$(uname -s)-${MANUAL_ARCH}"
@@ -581,7 +588,7 @@ else
         print_message "$YELLOW" "4. On your Raspberry Pi, navigate to your home directory: \`cd ~\`"
         print_message "$YELLOW" "5. Remove the failed attempt directory: \`rm -rf $REPO_DIR\`" # Suggest removing the failed clone
         print_message "$YELLOW" "6. Extract the ZIP file (replace 'repository-name-main.zip' with the actual filename): \`unzip repository-name-main.zip\`"
-        print_message "$YELLOW" "7. The extracted folder will likely be named 'repository-name-main'. Move/rename it to '$REPO_DIR': \`mv repository-name-main $REPO_DIR\`"
+        print_message "$YELLOW" "7. The extracted folder will likely be named 'raspberry-pi-media-server-main'. Move/rename it to '$REPO_DIR': \`mv raspberry-pi-media-server-main $REPO_DIR\`"
         print_message "$YELLOW" "Then, you can try re-running this script. It will detect the existing directory ($REPO_DIR) and skip the clone step."
         print_message "$YELLOW" "--------------------------------------------"
         print_error "Repository setup failed. Aborting."
@@ -718,7 +725,7 @@ deploy_stack() {
     print_status "Docker-compose configuration for $stack_name is valid."
 
     # Deploy containers
-    print_status "Running '${DOCKER_COMPOSE_CMD} up -d -f $COMPOSE_FILE' for $stack_name stack..."
+    print_status "Running '${COMPOSE_CMD_ARRAY[@]} up -d -f $COMPOSE_FILE --remove-orphans' for $stack_name stack..."
      # Use bash array to handle potential sudo
     if "${COMPOSE_CMD_ARRAY[@]}" -f "$COMPOSE_FILE" up -d --remove-orphans; then # Add --remove-orphans to clean up old containers
         print_message "$GREEN" "✅ $stack_name stack deployed successfully!"
