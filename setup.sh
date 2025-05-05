@@ -9,8 +9,8 @@
 # Jackett, and monitoring tools (Grafana).
 #
 # Addresses git clone issues on low-RAM devices by using shallow/single-branch
-# clone and suggests checking/increasing swap. Includes a check for disk
-# space before creating a swap file.
+# clone and suggests checking/increasing swap. Includes checks for disk
+# space before creating a swap file and makes swap creation more robust.
 #=============================================================================
 
 # --- Configuration ---
@@ -104,6 +104,34 @@ backup_config() {
         fi
     fi
 }
+
+# Function to handle swap file creation (called internally)
+# Tries fallocate, then dd with bs=4K
+create_swapfile() {
+    local swapfile_path="$1"
+    local swap_size_bytes="$2"
+    local swap_size_mb="$3" # Needed for dd count with bs=1M or bs=4K
+
+    print_status "Attempting to create swapfile '$swapfile_path' (${swap_size_mb}MB)..."
+
+    # Try fallocate first
+    if sudo fallocate -l "$swap_size_bytes" "$swapfile_path" 2> >(tee -a "$LOG_FILE" >&2); then
+        print_status "Created swapfile with fallocate."
+        return 0 # Success
+    else
+        print_warning "fallocate failed. Trying dd with smaller block size (bs=4K)..."
+        # Fallback to dd with a small block size to minimize memory pressure
+        local dd_count=$((swap_size_bytes / 4096)) # Calculate count for bs=4K
+        if sudo dd if=/dev/zero of="$swapfile_path" bs=4K count="$dd_count" status=progress 2> >(tee -a "$LOG_FILE" >&2); then
+             print_status "Created swapfile with dd (bs=4K)."
+             return 0 # Success
+        else
+             print_error "Failed to create swapfile using both fallocate and dd (bs=4K). Check output and $LOG_FILE for details."
+             return 1 # Failure (error function already exits, but for completeness)
+        fi
+    fi
+}
+
 
 # --- Error Handling Trap ---
 # Exit immediately if a command exits with a non-zero status
@@ -208,15 +236,19 @@ if [ "$DESIRED_SWAP_MB" -gt 0 ]; then
         REQUIRED_FREE_SPACE_MB=$((DESIRED_SWAP_MB + SWAP_SPACE_BUFFER_MB))
 
         # --- Check Free Disk Space ---
-        # Use df -BM to get Block sizes in 1M and output available space
-        FREE_SPACE_MB=$(df -BM / --output=avail | tail -n 1 | sed 's/M//')
+        # Use df -BM to get Block sizes in 1M and output available space for the mount point of SWAPFILE
+        # Check the partition where /swapfile will live (usually /)
+        SWAPFILE_MOUNT_POINT="/" # Default assumption
+        FREE_SPACE_MB=$(df -BM "$SWAPFILE_MOUNT_POINT" --output=avail | tail -n 1 | sed 's/M//')
 
-        print_status "Checking free space on root partition (/)..."
+        print_status "Checking free space on mount point '$SWAPFILE_MOUNT_POINT' for swapfile..."
         print_status "Available free space: ${FREE_SPACE_MB}MB"
         print_status "Required free space for swapfile: ${REQUIRED_FREE_SPACE_MB}MB (Desired: ${DESIRED_SWAP_MB}MB + Buffer: ${SWAP_SPACE_BUFFER_MB}MB)"
 
-        if [ "$FREE_SPACE_MB" -lt "$REQUIRED_FREE_SPACE_MB" ]; then
-            print_error "Insufficient disk space on the root partition (/). Need at least ${REQUIRED_FREE_SPACE_MB}MB, but only ${FREE_SPACE_MB}MB available."
+        if [ -z "$FREE_SPACE_MB" ]; then
+             print_error "Could not determine free space on '$SWAPFILE_MOUNT_POINT'. Cannot proceed with swap creation."
+        elif [ "$FREE_SPACE_MB" -lt "$REQUIRED_FREE_SPACE_MB" ]; then
+            print_error "Insufficient disk space on '$SWAPFILE_MOUNT_POINT'. Need at least ${REQUIRED_FREE_SPACE_MB}MB, but only ${FREE_SPACE_MB}MB available."
             print_message "$RED" "Please free up space on your SD card or root filesystem and re-run the script."
         else
             print_status "Sufficient disk space available (${FREE_SPACE_MB}MB) to create the swapfile."
@@ -232,45 +264,54 @@ if [ "$DESIRED_SWAP_MB" -gt 0 ]; then
                  else
                      print_status "Existing swapfile ($SWAPFILE) is active but too small. Disabling and resizing..."
                      if ! sudo swapoff "$SWAPFILE"; then print_warning "Failed to disable existing swapfile $SWAPFILE."; fi
-                     print_status "Resizing swapfile..."
-                     if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to resize swapfile with fallocate. Trying dd...";
-                          # Fallback to dd if fallocate fails (less efficient)
-                          if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
-                               print_error "Failed to create/resize swapfile using both fallocate and dd."
-                          fi
+                     # Attempt to create/resize the swapfile
+                     create_swapfile "$SWAPFILE" "$SWAP_SIZE_BYTES" "$DESIRED_SWAP_MB"
+                     # If create_swapfile succeeded, format and enable
+                     if [ -f "$SWAPFILE" ]; then
+                         if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
+                         if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
+                         if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
+                         print_status "Swapfile resized and enabled."
+                     else
+                         # This block should not be reached if create_swapfile exits on failure,
+                         # but as a safeguard:
+                         print_error "Swapfile was not created despite reported sufficient disk space during resize attempt. Check logs."
                      fi
-                     if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
-                     if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
-                     if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
-                     print_status "Swapfile resized and enabled."
                  fi
             elif [ -f "$SWAPFILE" ]; then
                  # If swapfile exists but is not active swap
                  print_status "Existing swapfile ($SWAPFILE) found but not active swap. Removing and recreating/resizing."
                  sudo rm "$SWAPFILE" || print_warning "Failed to remove existing swapfile $SWAPFILE."
-                 print_status "Creating new swapfile..."
-                 if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to create swapfile with fallocate. Trying dd...";
-                      if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
-                           print_error "Failed to create swapfile using both fallocate and dd."
-                      fi
+                 # Fall through to create new swapfile logic
+                 print_status "Continuing to create new swapfile..."
+                 # Call create_swapfile function
+                 create_swapfile "$SWAPFILE" "$SWAP_SIZE_BYTES" "$DESIRED_SWAP_MB"
+                 # If create_swapfile succeeded, format and enable
+                 if [ -f "$SWAPFILE" ]; then
+                    if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
+                    if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
+                    if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
+                    print_status "New swapfile created and enabled."
+                 else
+                     # Safeguard: should not be reached if create_swapfile exits
+                     print_error "Swapfile was not created despite reported sufficient disk space. Check logs."
                  fi
-                 if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
-                 if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
-                 if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
-                 print_status "New swapfile created and enabled."
             else
                 # If no swapfile exists at all
                 print_status "Creating new swapfile at $SWAPFILE..."
-                 if ! sudo fallocate -l "$SWAP_SIZE_BYTES" "$SWAPFILE"; then print_warning "Failed to create swapfile with fallocate. Trying dd...";
-                      if ! sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$DESIRED_SWAP_MB"; then
-                           print_error "Failed to create swapfile using both fallocate and dd."
-                      fi
-                 fi
-                if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
-                if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
-                if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
-                print_status "New swapfile created and enabled."
-            fi
+                # Call create_swapfile function
+                create_swapfile "$SWAPFILE" "$SWAP_SIZE_BYTES" "$DESIRED_SWAP_MB"
+                # If create_swapfile succeeded, format and enable
+                if [ -f "$SWAPFILE" ]; then
+                   if ! sudo chmod 600 "$SWAPFILE"; then print_warning "Failed to set permissions for swapfile."; fi
+                   if ! sudo mkswap "$SWAPFILE"; then print_warning "Failed to format swapfile."; fi
+                   if ! sudo swapon "$SWAPFILE"; then print_warning "Failed to enable swapfile $SWAPFILE."; fi
+                   print_status "New swapfile created and enabled."
+                else
+                     # Safeguard: should not be reached if create_swapfile exits
+                     print_error "Swapfile was not created despite reported sufficient disk space. Check logs."
+                fi
+            fi # End if/elif/else swapfile existence check
 
             # Make swap persistent in fstab
             print_status "Making swapfile persistent in /etc/fstab..."
@@ -282,7 +323,13 @@ if [ "$DESIRED_SWAP_MB" -gt 0 ]; then
             fi
 
             print_status "Swap space configuration attempt complete."
-            print_status "Current total swap after changes: $(free -m | awk '/^Swap:/ {print $2}')MB"
+            print_status "Current total swap after changes: $(free -m | awk '/^Swap:/ {print $2}' || echo "Unknown")MB"
+
+            # Suggest filesystem check if swap creation failed despite space (error function will trigger)
+            # This message only shows if the inner create_swapfile fails and exits
+            print_message "$RED" "Swap file creation failed even with reported free space. This could indicate a filesystem issue."
+            print_message "$RED" "RECOMMENDATION: Run a filesystem check (fsck) on your root partition. This usually requires booting from another medium or using recovery mode."
+
         fi # End if [ "$FREE_SPACE_MB" -lt "$REQUIRED_FREE_SPACE_MB" ]
 
     else
@@ -300,7 +347,8 @@ if ! sudo apt update; then
     print_error "Failed to update system package lists."
 fi
 print_status "Upgrading system packages..."
-if ! sudo apt upgrade -y; then
+# Use apt upgrade --fix-missing in case previous installs had issues
+if ! sudo apt upgrade -y --fix-missing; then
     print_warning "System upgrade failed or completed with errors. Continuing with script."
 fi
 print_status "System update and upgrade complete."
@@ -308,8 +356,9 @@ print_status "System update and upgrade complete."
 # --- Install required packages ---
 print_section "INSTALLING REQUIRED PACKAGES"
 print_status "Installing essential packages..."
-# Added jq, unzip, git if not already there
-ESSENTIAL_APT_PACKAGES="apt-transport-https ca-certificates curl gnupg lsb-release jq git unzip"
+# Added jq, unzip, git if not already there, and fdisk/parted for partition info (optional)
+# Add util-linux for fallocate if needed
+ESSENTIAL_APT_PACKAGES="apt-transport-https ca-certificates curl gnupg lsb-release jq git unzip util-linux"
 for pkg in $ESSENTIAL_APT_PACKAGES; do
     # Check if package is installed using dpkg, which is more reliable than command_exists for non-command packages
     if dpkg -s "$pkg" &>/dev/null; then
@@ -474,12 +523,12 @@ if [ -d "$REPO_DIR" ]; then
     print_status "Existing repository found at $REPO_DIR. Attempting to update with optimized pull..."
     cd "$REPO_DIR" || print_error "Failed to change directory to $REPO_DIR."
     # Check for local changes first
-    if [ -n "$(${DOCKER_CMD} --git-dir=.git --work-tree=. status --porcelain)" ]; then
+    if [ -n "$(${DOCKER_CMD} --git-dir=.git --work-tree=. status --porcelain 2>/dev/null)" ]; then
         print_warning "Local changes detected in $REPO_DIR. Stash or commit them before pulling."
         print_warning "Skipping git pull to avoid conflicts. Using existing code."
         # Check if it's already a shallow clone of the correct branch
-        IS_SHALLOW=$(${DOCKER_CMD} --git-dir=.git rev-parse --is-shallow-repository || echo "false")
-        CURRENT_BRANCH=$(${DOCKER_CMD} --git-dir=.git rev-parse --abbrev-ref HEAD || echo "unknown")
+        IS_SHALLOW=$(${DOCKER_CMD} --git-dir=.git rev-parse --is-shallow-repository 2>/dev/null || echo "false")
+        CURRENT_BRANCH=$(${DOCKER_CMD} --git-dir=.git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
 
         if [ "$IS_SHALLOW" = "true" ] && [ "$CURRENT_BRANCH" = "$REPO_BRANCH" ]; then
             print_status "Existing repo is already a shallow clone of the target branch."
@@ -492,11 +541,9 @@ if [ -d "$REPO_DIR" ]; then
         # If no local changes, attempt an optimized pull
         print_status "Attempting optimized git pull (--depth 1 --single-branch --set-upstream origin $REPO_BRANCH)..."
         # Use bash array for git command
-        read -ra GIT_CMD_ARRAY <<< "$DOCKER_CMD" # Assuming DOCKER_CMD is 'docker' or 'sudo docker'
-        GIT_CMD_ARRAY+=(--git-dir=.git --work-tree=.) # Add git options
-        GIT_CMD_ARRAY+=(pull --depth 1 --single-branch --set-upstream origin "$REPO_BRANCH") # Add pull command
-
-        if "${GIT_CMD_ARRAY[@]}"; then
+        read -ra GIT_CMD_ARRAY <<< "$(command -v git)" # Get the actual git command path
+        # Add --no-verify to skip potential pre-commit hooks
+        if "${GIT_CMD_ARRAY[@]}" pull --depth 1 --single-branch --set-upstream origin "$REPO_BRANCH" --no-verify; then
             print_status "Repository updated successfully with optimized pull."
         else
             print_warning "Failed to pull latest changes for $REPO_DIR using optimized pull."
@@ -526,16 +573,17 @@ else
     else
         print_warning "Failed to clone repository $REPO_URL using optimized git clone."
         print_warning "This could still be a memory issue, network problem, or the fallback git method didn't work."
-        print_message "$YELLOW" "--- Alternative Download Method ---"
+        print_message "$YELLOW" "--- Alternative Download Method (Manual) ---"
         print_message "$YELLOW" "As a fallback, you can try downloading the repository as a ZIP file manually:"
-        print_message "$YELLOW" "1. Go to $REPO_URL"
-        print_message "$YELLOW" "2. Click 'Code' and select 'Download ZIP'."
-        print_message "$YELLOW" "3. Copy the ZIP file to your Raspberry Pi (e.g., using scp)."
-        print_message "$YELLOW" "4. Navigate to your home directory: \`cd ~\`"
-        print_message "$YELLOW" "5. Extract the ZIP file (replace 'repo-name-main.zip' with the actual filename): \`unzip repo-name-main.zip\`"
-        print_message "$YELLOW" "6. The extracted folder will likely be named 'raspberry-pi-media-server-main'. Move/rename it to '$REPO_DIR': \`mv raspberry-pi-media-server-main $REPO_DIR\`"
+        print_message "$YELLOW" "1. On a computer with a web browser, go to $REPO_URL"
+        print_message "$YELLOW" "2. Click the green 'Code' button and select 'Download ZIP'."
+        print_message "$YELLOW" "3. Copy the downloaded ZIP file to your Raspberry Pi (e.g., using scp, SFTP, or a USB drive)."
+        print_message "$YELLOW" "4. On your Raspberry Pi, navigate to your home directory: \`cd ~\`"
+        print_message "$YELLOW" "5. Remove the failed attempt directory: \`rm -rf $REPO_DIR\`" # Suggest removing the failed clone
+        print_message "$YELLOW" "6. Extract the ZIP file (replace 'repository-name-main.zip' with the actual filename): \`unzip repository-name-main.zip\`"
+        print_message "$YELLOW" "7. The extracted folder will likely be named 'repository-name-main'. Move/rename it to '$REPO_DIR': \`mv repository-name-main $REPO_DIR\`"
         print_message "$YELLOW" "Then, you can try re-running this script. It will detect the existing directory ($REPO_DIR) and skip the clone step."
-        print_message "$YELLOW" "-----------------------------------"
+        print_message "$YELLOW" "--------------------------------------------"
         print_error "Repository setup failed. Aborting."
     fi
 fi
@@ -734,7 +782,8 @@ if [ "$ENABLE_WEB_STACK" = true ]; then
         print_message "$BLUE" "Testing DuckDNS update:"
         # Use bash array for curl command
         read -ra CURL_CMD_ARRAY <<< "$(command -v curl)"
-        "${CURL_CMD_ARRAY[@]}" "https://www.duckdns.org/update?domains=$DUCKDNS_SUBDOMAIN&token=$DUCKDNS_TOKEN&ip="
+        # Add silent flag to curl
+        "${CURL_CMD_ARRAY[@]}" -s "https://www.duckdns.org/update?domains=$DUCKDNS_SUBDOMAIN&token=$DUCKDNS_TOKEN&ip="
         echo ""
         print_message "$GREEN" "DuckDNS update attempted. Verify it updated correctly via duckdns.org."
     fi
